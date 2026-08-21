@@ -1,12 +1,11 @@
 # Petkit BLE Water Fountain - Home Assistant Integration
 
+> This is a fork of [pdiegmann/ha-petkit-ble](https://github.com/pdiegmann/ha-petkit-ble), with fixes for BLE reconnection reliability.
+
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/custom-components/hacs)
 [![GitHub Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]
 [![License][license-shield]](LICENSE)
-
-![Project Maintenance][maintenance-shield]
-[![BuyMeCoffee][buymecoffeebadge]][buymecoffee]
 
 A Home Assistant integration for controlling Petkit W5 series water fountains via Bluetooth Low Energy (BLE). Control your pet's water fountain locally without cloud dependencies.
 
@@ -37,7 +36,7 @@ A Home Assistant integration for controlling Petkit W5 series water fountains vi
 1. Make sure [HACS](https://hacs.xyz/) is installed in your Home Assistant instance
 2. In HACS, go to "Integrations"
 3. Click the three dots in the top right corner and select "Custom repositories"
-4. Add this repository URL: `https://github.com/pdiegmann/ha-petkit-ble`
+4. Add this repository URL: `https://github.com/drjjr2/ha-petkit-ble`
 5. Select "Integration" as the category
 6. Click "Add"
 7. Find "Petkit BLE Water Fountain" in the integration list and install it
@@ -193,11 +192,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-[buymecoffee]: https://www.buymeacoffee.com/pdiegmann
-[buymecoffeebadge]: https://img.shields.io/badge/buy%20me%20a%20coffee-donate-yellow.svg?style=for-the-badge
-[commits-shield]: https://img.shields.io/github/commit-activity/y/pdiegmann/ha-petkit-ble.svg?style=for-the-badge
-[commits]: https://github.com/pdiegmann/ha-petkit-ble/commits/main
-[license-shield]: https://img.shields.io/github/license/pdiegmann/ha-petkit-ble.svg?style=for-the-badge
-[maintenance-shield]: https://img.shields.io/badge/maintainer-%40pdiegmann-blue.svg?style=for-the-badge
-[releases-shield]: https://img.shields.io/github/release/pdiegmann/ha-petkit-ble.svg?style=for-the-badge
-[releases]: https://github.com/pdiegmann/ha-petkit-ble/releases
+[commits-shield]: https://img.shields.io/github/commit-activity/y/drjjr2/ha-petkit-ble.svg?style=for-the-badge
+[commits]: https://github.com/drjjr2/ha-petkit-ble/commits/main
+[license-shield]: https://img.shields.io/github/license/drjjr2/ha-petkit-ble.svg?style=for-the-badge
+[releases-shield]: https://img.shields.io/github/release/drjjr2/ha-petkit-ble.svg?style=for-the-badge
+[releases]: https://github.com/drjjr2/ha-petkit-ble/releases
