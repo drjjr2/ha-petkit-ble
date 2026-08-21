@@ -205,7 +205,13 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
             
             if not await self.ble_manager.connect_device(self.address):
                 raise UpdateFailed(f"Could not connect to device {self.address}")
-            
+
+            # Watch for HA re-discovering this device's advertisements so we can
+            # reconnect the instant it's back in range instead of relying purely
+            # on polling.
+            if hasattr(self.ble_manager, "start_advertisement_watch"):
+                self.ble_manager.start_advertisement_watch()
+
             # Start message consumer
             _LOGGER.info("Starting message consumer...")
             self._consumer_task = asyncio.create_task(
@@ -332,7 +338,10 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
             self.entry.async_remove_update_listener(self.async_options_updated)
         except (ValueError, KeyError):
             pass  # Listener may not be registered or already removed
-        
+
+        if hasattr(self.ble_manager, "stop_advertisement_watch"):
+            self.ble_manager.stop_advertisement_watch()
+
         if self._consumer_task:
             self._consumer_task.cancel()
             try:
@@ -420,10 +429,20 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
             if hasattr(self.ble_manager, '_immediate_reconnect'):
                 self.ble_manager._immediate_reconnect = True
             
-            # Use the immediate reconnection loop
-            if hasattr(self.ble_manager, '_immediate_reconnection_loop'):
-                await self.ble_manager._immediate_reconnection_loop(self.address)
-                
+            # Use the immediate reconnection loop. Go through _schedule_reconnect
+            # rather than calling _immediate_reconnection_loop directly — it's the
+            # single gatekeeper that prevents this from racing a reconnect attempt
+            # already in flight from the disconnect callback or advertisement watcher.
+            if hasattr(self.ble_manager, '_schedule_reconnect'):
+                self.ble_manager._schedule_reconnect(self.address)
+
+                connected_event = getattr(self.ble_manager, '_connected_event', None)
+                if connected_event is not None:
+                    try:
+                        await asyncio.wait_for(connected_event.wait(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        pass
+
                 # If reconnected, restart message consumer
                 if self.address in self.ble_manager.connected_devices:
                     if self._consumer_task and not self._consumer_task.done():

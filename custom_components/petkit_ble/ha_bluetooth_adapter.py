@@ -55,6 +55,8 @@ class HABluetoothAdapter:
         self._reset_interval = 300.0  # Reset connection attempts every 5 minutes
         self._immediate_reconnect = True  # Flag for immediate reconnection
         self._reconnection_task = None  # Track reconnection task
+        self._unsub_bluetooth_callback = None  # HA advertisement-callback unsubscribe handle
+        self._connected_event = asyncio.Event()  # Set while a client is connected
 
     async def scan(self) -> dict[str, Any]:
         """Scan for Petkit BLE devices using HA's bluetooth integration."""
@@ -138,16 +140,24 @@ class HABluetoothAdapter:
                 return False
             
             self.logger.debug(f"Device found in scan, establishing BLE connection...")
-            
-            # Use bleak-retry-connector directly with the BLE device
+
+            # Use bleak-retry-connector directly with the BLE device.
+            # - disconnected_callback gives us an immediate, event-driven signal the
+            #   instant BlueZ tears down the link, instead of only finding out on the
+            #   next write/poll (which could be many seconds later).
+            # - use_services_cache=False avoids BlueZ handing back a stale GATT
+            #   service/characteristic cache after the fountain reboots or was paired
+            #   elsewhere, which otherwise causes writes to silently go nowhere.
             from bleak import BleakClient
             self._client = await establish_connection(
                 BleakClient,
                 self._ble_device,
                 address,
+                disconnected_callback=self._on_client_disconnected,
+                use_services_cache=False,
                 timeout=10.0  # Reduced timeout for faster retries
             )
-            
+
             self.connected_devices[address] = self._client
             self._update_connection_status(ConnectionStatus.CONNECTED)
             self._update_last_seen()
@@ -184,6 +194,70 @@ class HABluetoothAdapter:
             
             return False
 
+    def _on_client_disconnected(self, client) -> None:
+        """Called by bleak the instant BlueZ tears down the connection.
+
+        This runs synchronously on the event loop (not a coroutine), so it must
+        not await anything. Its only job is to update our bookkeeping and kick
+        off a reconnect immediately, instead of waiting for the next write or
+        poll to notice the client has gone away.
+        """
+        address = self.address
+        self.logger.warning(f"🔌 BLE client for {address} disconnected unexpectedly")
+        self.connected_devices.pop(address, None)
+        self._update_connection_status(ConnectionStatus.RECONNECTING, "Unexpected disconnect")
+
+        if self._immediate_reconnect:
+            self._schedule_reconnect(address)
+
+    def _schedule_reconnect(self, address: str) -> None:
+        """Ensure exactly one reconnection loop is running for this device.
+
+        Several places can notice a dropped connection at roughly the same time
+        (the disconnect callback, a failed write, the advertisement watcher, the
+        message consumer). Without a single gatekeeper, each of them used to
+        spawn its own `_immediate_reconnection_loop` task, and overlapping
+        connection attempts against the same BlueZ device is a good way to make
+        a flaky peripheral even flakier. This is the only place that should
+        create that task.
+        """
+        if self._reconnection_task and not self._reconnection_task.done():
+            return
+        self._reconnection_task = asyncio.create_task(self._immediate_reconnection_loop(address))
+
+    def start_advertisement_watch(self) -> None:
+        """React the instant HA's scanner sees this device advertise again.
+
+        Without this, reconnection relies entirely on polling (asking HA "have
+        you seen it?" on a timer), which means a real-world reconnect can lag
+        behind the device actually being back in range. HA already fires this
+        callback the moment a matching advertisement comes in, so use it to
+        trigger a reconnect attempt immediately instead of waiting on the poll.
+        """
+        if self._unsub_bluetooth_callback:
+            return
+
+        @callback
+        def _on_advertisement(service_info, change) -> None:
+            if not self.connected_devices.get(self.address) and self._immediate_reconnect:
+                self.logger.debug(
+                    f"📡 Advertisement seen for {self.address} while disconnected — triggering reconnect"
+                )
+                self._schedule_reconnect(self.address)
+
+        self._unsub_bluetooth_callback = bluetooth.async_register_callback(
+            self.hass,
+            _on_advertisement,
+            {"address": self.address},
+            bluetooth.BluetoothScanningMode.PASSIVE,
+        )
+
+    def stop_advertisement_watch(self) -> None:
+        """Unregister the advertisement-watch callback, if one is active."""
+        if self._unsub_bluetooth_callback:
+            self._unsub_bluetooth_callback()
+            self._unsub_bluetooth_callback = None
+
     async def disconnect_device(self, address: str, trigger_reconnect: bool = False) -> bool:
         """Disconnect from device.
         
@@ -202,7 +276,7 @@ class HABluetoothAdapter:
                 # Trigger immediate reconnection if requested and enabled
                 if trigger_reconnect and self._immediate_reconnect:
                     self.logger.info("Triggering immediate reconnection after disconnect")
-                    asyncio.create_task(self._immediate_reconnection_loop(address))
+                    self._schedule_reconnect(address)
                 
                 return True
             return False
@@ -216,7 +290,7 @@ class HABluetoothAdapter:
             # Trigger immediate reconnection on unexpected disconnect
             if self._immediate_reconnect:
                 self.logger.info("Triggering immediate reconnection after unexpected disconnect")
-                asyncio.create_task(self._immediate_reconnection_loop(address))
+                self._schedule_reconnect(address)
             
             return False
 
@@ -247,7 +321,7 @@ class HABluetoothAdapter:
                     self._update_connection_status(ConnectionStatus.RECONNECTING, "Client disconnected during write")
                     # Trigger immediate reconnection
                     if self._immediate_reconnect:
-                        asyncio.create_task(self._immediate_reconnection_loop(address))
+                        self._schedule_reconnect(address)
                     return False
                     
                 await client.write_gatt_char(characteristic_uuid, data)
@@ -258,7 +332,7 @@ class HABluetoothAdapter:
                 self.logger.debug(f"Device {address} not connected for write operation")
                 # Attempt immediate reconnection if not connected
                 if self._immediate_reconnect and self._connection_status != ConnectionStatus.CONNECTING:
-                    asyncio.create_task(self._immediate_reconnection_loop(address))
+                    self._schedule_reconnect(address)
                 return False
         except Exception as err:
             error_msg = f"Write failed: {err}"
@@ -269,7 +343,7 @@ class HABluetoothAdapter:
             self._update_connection_status(ConnectionStatus.RECONNECTING, error_msg)
             # Trigger immediate reconnection
             if self._immediate_reconnect:
-                asyncio.create_task(self._immediate_reconnection_loop(address))
+                self._schedule_reconnect(address)
             return False
 
     async def start_notifications(self, address: str, characteristic_uuid: str) -> bool:
@@ -333,7 +407,8 @@ class HABluetoothAdapter:
                         
                         if self._immediate_reconnect:
                             # Use immediate reconnection loop instead of backoff
-                            await self._immediate_reconnection_loop(address)
+                            self._schedule_reconnect(address)
+                            await asyncio.sleep(0.5)
                         else:
                             await self._attempt_reconnection_with_backoff(address)
                     elif self._connection_status == ConnectionStatus.FAILED:
@@ -342,11 +417,17 @@ class HABluetoothAdapter:
                             self.logger.info("Connection previously failed, retrying immediately...")
                             # Reset attempts to allow more retries
                             self._connection_attempts = 0
-                            await self._immediate_reconnection_loop(address)
+                            self._schedule_reconnect(address)
+                            await asyncio.sleep(0.5)
                         else:
                             await asyncio.sleep(30)
-                    
-                    await asyncio.sleep(0.1)  # Very short sleep between checks
+                    else:
+                        # A reconnect attempt is already in flight (scheduled by the
+                        # disconnect callback, the advertisement watcher, or a prior
+                        # pass through this loop) — just wait for it rather than
+                        # spinning a tight poll loop.
+                        await asyncio.sleep(0.5)
+
                     continue
                     
                 message = await self.queue.get()
@@ -363,7 +444,8 @@ class HABluetoothAdapter:
                     self.queue.task_done()
                 # Use immediate reconnection on error
                 if self._immediate_reconnect:
-                    await self._immediate_reconnection_loop(address)
+                    self._schedule_reconnect(address)
+                    await asyncio.sleep(0.5)
                 else:
                     await self._attempt_reconnection_with_backoff(address)
                 
@@ -417,6 +499,14 @@ class HABluetoothAdapter:
         if error:
             self._connection_error = str(error)
         
+        # Keep the connected-event in sync so anything waiting on "are we up yet"
+        # (message_consumer, coordinator reconnection helpers) reacts immediately
+        # rather than polling.
+        if status == ConnectionStatus.CONNECTED:
+            self._connected_event.set()
+        else:
+            self._connected_event.clear()
+
         # Only log when status actually changes
         if old_status != status or self._last_logged_status != status:
             if status == ConnectionStatus.CONNECTED:
@@ -459,14 +549,13 @@ class HABluetoothAdapter:
             return delay
     
     async def _immediate_reconnection_loop(self, address: str) -> None:
-        """Immediately and continuously attempt to reconnect."""
-        # Avoid multiple reconnection loops
-        if self._reconnection_task and not self._reconnection_task.done():
-            self.logger.debug("Reconnection already in progress, skipping duplicate loop")
-            return
-        
-        self._reconnection_task = asyncio.current_task()
-        
+        """Immediately and continuously attempt to reconnect.
+
+        Only ever entered via `_schedule_reconnect`, which is the single
+        gatekeeper that ensures at most one of these runs at a time — don't
+        call this directly or duplicate/overlapping reconnect attempts can
+        start racing each other against the same BlueZ device.
+        """
         while not self.connected_devices.get(address):
             try:
                 if not self._should_attempt_retry():
