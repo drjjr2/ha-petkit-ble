@@ -218,13 +218,20 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
                 self.ble_manager.message_consumer(self.address, Constants.WRITE_UUID)
             )
             
+            # Allow BLE stack to stabilize after connection before subscribing to
+            # notifications. The fountain's own BLE stack routinely isn't ready to
+            # accept a notify-subscribe (CCCD write) the instant the physical link
+            # comes up — subscribing immediately loses that race in various ways
+            # (GATT error 133/129, "insufficient authorization", flat disconnects)
+            # depending on exact timing. This delay must happen BEFORE
+            # start_notifications, not after — a post-hoc sleep here does nothing
+            # for the subscribe call that already raced and lost.
+            _LOGGER.debug("Waiting for BLE stack to stabilize before subscribing...")
+            await asyncio.sleep(0.5)
+
             # Start notifications for device updates
             _LOGGER.info("Starting BLE notifications...")
             await self.ble_manager.start_notifications(self.address, Constants.READ_UUID)
-            
-            # Allow BLE stack to stabilize after connection
-            _LOGGER.debug("Waiting for BLE stack to stabilize...")
-            await asyncio.sleep(0.2)  # Reduced delay - Petkit devices disconnect quickly if idle
             
             # Verify client is actually ready for writes
             client = self.ble_manager.connected_devices.get(self.address)

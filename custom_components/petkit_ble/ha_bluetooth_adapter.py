@@ -347,19 +347,40 @@ class HABluetoothAdapter:
             return False
 
     async def start_notifications(self, address: str, characteristic_uuid: str) -> bool:
-        """Start notifications using HA's bluetooth client."""
-        try:
-            if address in self.connected_devices:
+        """Start notifications using HA's bluetooth client.
+
+        Retries a couple of times with a short backoff before giving up. The
+        settle delay before this is called (see callers) covers the common
+        case, but this device occasionally still isn't ready on the first
+        try — retrying here in place is much cheaper than tearing down and
+        re-establishing the whole connection, which is what happened before
+        (every failure here used to propagate up and trigger a full
+        reconnect, which is the main source of the connect/disconnect churn).
+        """
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if address not in self.connected_devices:
+                    self.logger.error(f"Device {address} not connected")
+                    return False
+
                 client = self.connected_devices[address]
                 await client.start_notify(characteristic_uuid, self._handle_notification_wrapper)
                 self.logger.info(f"Notifications started for {characteristic_uuid}")
                 return True
-            else:
-                self.logger.error(f"Device {address} not connected")
-                return False
-        except Exception as err:
-            self.logger.error(f"Error starting notifications for {characteristic_uuid}: {err}")
-            return False
+            except Exception as err:
+                if attempt < max_attempts:
+                    self.logger.debug(
+                        f"Notify-subscribe attempt {attempt}/{max_attempts} failed for "
+                        f"{characteristic_uuid}: {err} — retrying shortly"
+                    )
+                    await asyncio.sleep(0.5)
+                else:
+                    self.logger.error(
+                        f"Error starting notifications for {characteristic_uuid} "
+                        f"after {max_attempts} attempts: {err}"
+                    )
+        return False
 
     async def stop_notifications(self, address: str, characteristic_uuid: str) -> bool:
         """Stop notifications using HA's bluetooth client."""
@@ -572,9 +593,14 @@ class HABluetoothAdapter:
                 
                 if success:
                     self.logger.info(f"✅ Immediate reconnection successful after {self._connection_attempts} attempts!")
-                    # Restart notifications after successful reconnection
+                    # Restart notifications after successful reconnection. Give the
+                    # BLE stack a moment to settle first — subscribing the instant
+                    # the link comes back up is the main reason this loop used to
+                    # fire again a few seconds later (see coordinator._initialize_device
+                    # for the same fix on the initial-connect path).
                     try:
                         from .PetkitW5BLEMQTT.constants import Constants
+                        await asyncio.sleep(0.5)
                         await self.start_notifications(address, Constants.READ_UUID)
                         self.logger.info("📡 Notifications restarted successfully")
                     except Exception as e:
