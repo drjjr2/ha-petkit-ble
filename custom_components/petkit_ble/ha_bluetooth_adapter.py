@@ -16,6 +16,25 @@ from homeassistant.helpers.device_registry import format_mac
 
 _LOGGER = logging.getLogger(__name__)
 
+# Prefer routing this device's connections through a specific BLE proxy when it's
+# currently available, instead of always taking whichever proxy HA's Bluetooth
+# manager thinks has the best RSSI right now. HA's automatic selection re-evaluates
+# from scratch on every connection attempt and has no concept of a "preferred"
+# source, so a technically-stronger-but-less-convenient (or less reliable, for this
+# particular device) scanner can win over one you'd rather it use — e.g. the
+# Kitchen Panel Kiosk Satellite proxy, which sits in the same room as the fountain.
+#
+# This only affects source selection for THIS device/address — it does not disable,
+# deprioritize, or otherwise touch any other proxy for any other Bluetooth device in
+# the house. When the preferred source doesn't currently see this device (e.g. it's
+# offline or out of range), connection falls straight back to HA's normal automatic
+# best-RSSI selection across every other available proxy, so the ESP32 proxies stay
+# fully available as a fallback path.
+#
+# Set to the `source` (MAC) of the scanner you want prioritized, or None to disable
+# this and always use HA's automatic best-RSSI selection.
+PREFERRED_SOURCE = "BA:34:AD:D6:58:B9"  # Kitchen Panel Kiosk Satellite proxy
+
 class ConnectionStatus(Enum):
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
@@ -107,6 +126,53 @@ class HABluetoothAdapter:
             self.logger.error(f"Error scanning for devices: {err}")
             return {}
 
+    def _get_preferred_ble_device(self, address: str):
+        """Return a BLEDevice for `address`, preferring PREFERRED_SOURCE.
+
+        If PREFERRED_SOURCE currently has an active advertisement for this
+        device, use that scanner's BLEDevice directly instead of whatever HA's
+        automatic best-RSSI selection would pick. If it doesn't see the device
+        right now (offline, out of range, not yet discovered), fall back to
+        HA's normal automatic selection across all other available proxies —
+        this never disables or bypasses any other scanner, it only changes
+        which one wins when there's a choice.
+        """
+        if PREFERRED_SOURCE:
+            try:
+                scanner_devices = bluetooth.async_scanner_devices_by_address(
+                    self.hass, address, connectable=True
+                )
+                # Normalize for comparison (colon/case differences between how
+                # scanner.source is formatted vs. how PREFERRED_SOURCE is written).
+                preferred_norm = PREFERRED_SOURCE.replace(":", "").lower()
+                seen = []
+                for scanner_device in scanner_devices:
+                    scanner = scanner_device.scanner
+                    source = getattr(scanner, "source", "") or ""
+                    name = getattr(scanner, "name", "") or source
+                    seen.append(f"{name} [{source}]")
+                    if source.replace(":", "").lower() == preferred_norm:
+                        self.logger.debug(f"📍 Using preferred proxy {name} for {address}")
+                        return scanner_device.ble_device
+
+                # Preferred source not among current candidates — log what WAS
+                # available (occasionally) so it's easy to confirm/correct
+                # PREFERRED_SOURCE by checking the debug log against this list.
+                if seen and self._connection_attempts % 20 == 0:
+                    self.logger.debug(
+                        f"Preferred proxy {PREFERRED_SOURCE} not currently seeing "
+                        f"{address}; candidates were: {', '.join(seen)}"
+                    )
+            except Exception as err:
+                self.logger.debug(
+                    f"Preferred-proxy lookup failed for {address}, "
+                    f"falling back to automatic selection: {err}"
+                )
+
+        return bluetooth.async_ble_device_from_address(
+            self.hass, address, connectable=True
+        )
+
     async def connect_device(self, address: str) -> bool:
         """Connect to device using HA's bluetooth integration."""
         try:
@@ -120,12 +186,11 @@ class HABluetoothAdapter:
                     self.logger.info(f"🔄 BLE reconnection attempt #{self._connection_attempts} to {address}")
             
             self._last_connection_attempt = time.time()
-            
-            # Get BLE device from HA's bluetooth integration
-            self._ble_device = bluetooth.async_ble_device_from_address(
-                self.hass, address, connectable=True
-            )
-            
+
+            # Get BLE device from HA's bluetooth integration, preferring
+            # PREFERRED_SOURCE when it currently sees this device.
+            self._ble_device = self._get_preferred_ble_device(address)
+
             if not self._ble_device:
                 error_msg = f"Device {address} not found in HA bluetooth scan"
                 self._connection_attempts += 1
@@ -356,6 +421,16 @@ class HABluetoothAdapter:
         re-establishing the whole connection, which is what happened before
         (every failure here used to propagate up and trigger a full
         reconnect, which is the main source of the connect/disconnect churn).
+
+        Some Bluetooth proxies (observed on an Android-based Kiosk Satellite
+        proxy) don't fully clear their notify-subscription state across a
+        disconnect, so a start_notify() issued after reconnecting can raise
+        "Notifications are already enabled" even though nothing is actually
+        wrong — the desired end state (active notifications) already holds.
+        Treat that specific error as success rather than retrying it (retrying
+        just repeats the same "already enabled" error every time and burns
+        all the retry attempts, which used to bubble up as a hard failure and
+        tear down an otherwise-working connection).
         """
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -369,6 +444,13 @@ class HABluetoothAdapter:
                 self.logger.info(f"Notifications started for {characteristic_uuid}")
                 return True
             except Exception as err:
+                if "already enabled" in str(err).lower():
+                    self.logger.debug(
+                        f"Notifications for {characteristic_uuid} were already "
+                        f"active on reconnect — treating as success: {err}"
+                    )
+                    return True
+
                 if attempt < max_attempts:
                     self.logger.debug(
                         f"Notify-subscribe attempt {attempt}/{max_attempts} failed for "

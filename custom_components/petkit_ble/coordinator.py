@@ -343,8 +343,12 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
         # Remove options update listener
         try:
             self.entry.async_remove_update_listener(self.async_options_updated)
-        except (ValueError, KeyError):
-            pass  # Listener may not be registered or already removed
+        except Exception:
+            # Listener may not be registered/already removed, or (on newer HA
+            # core) ConfigEntry may not expose this method at all — either way
+            # this is best-effort cleanup and shouldn't block the rest of
+            # teardown or get counted as an initialization failure.
+            pass
 
         if hasattr(self.ble_manager, "stop_advertisement_watch"):
             self.ble_manager.stop_advertisement_watch()
