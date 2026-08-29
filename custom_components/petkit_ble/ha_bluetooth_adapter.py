@@ -375,41 +375,70 @@ class HABluetoothAdapter:
             return None
 
     async def write_characteristic(self, address: str, characteristic_uuid: str, data: bytes) -> bool:
-        """Write characteristic using HA's bluetooth client."""
-        try:
-            if address in self.connected_devices:
-                client = self.connected_devices[address]
-                # Check if client is still connected before attempting write
-                if hasattr(client, 'is_connected') and not client.is_connected:
-                    self.logger.warning(f"Client for {address} reports not connected, triggering immediate reconnection...")
-                    del self.connected_devices[address]
-                    self._update_connection_status(ConnectionStatus.RECONNECTING, "Client disconnected during write")
-                    # Trigger immediate reconnection
-                    if self._immediate_reconnect:
-                        self._schedule_reconnect(address)
-                    return False
-                    
-                await client.write_gatt_char(characteristic_uuid, data)
-                self.logger.debug(f"Write complete to {characteristic_uuid}")
-                self._update_last_seen()
-                return True
-            else:
+        """Write characteristic using HA's bluetooth client.
+
+        Retries a couple of times with a short backoff on a GATT-level write
+        failure (e.g. error 133) before tearing down the connection. Right
+        after a BLE proxy's own stack restarts (an app/firmware update, for
+        instance), it can accept a fresh connection and even a notify
+        subscribe just fine, but still isn't ready to service a write for a
+        few seconds. Without this, the very first command write after
+        reconnecting would immediately fail, tear the connection down, and
+        reconnect — looping as fast as possible with no backoff for as long
+        as the proxy's stack stayed unready, which is what turned a
+        few-second hiccup into hours of continuous flapping (observed after
+        a Kiosk Satellite proxy update: connect + notify-subscribe both
+        succeeded every time, but the first write after kept failing with
+        GATT error 133 and tearing the connection down before it had a
+        chance to settle).
+        """
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            if address not in self.connected_devices:
                 self.logger.debug(f"Device {address} not connected for write operation")
                 # Attempt immediate reconnection if not connected
                 if self._immediate_reconnect and self._connection_status != ConnectionStatus.CONNECTING:
                     self._schedule_reconnect(address)
                 return False
-        except Exception as err:
-            error_msg = f"Write failed: {err}"
-            self.logger.warning(f"Error writing to characteristic {characteristic_uuid}: {err}")
-            # Mark as disconnected so reconnection will be attempted
-            if address in self.connected_devices:
+
+            client = self.connected_devices[address]
+            # Check if client is still connected before attempting write
+            if hasattr(client, 'is_connected') and not client.is_connected:
+                self.logger.warning(f"Client for {address} reports not connected, triggering immediate reconnection...")
                 del self.connected_devices[address]
-            self._update_connection_status(ConnectionStatus.RECONNECTING, error_msg)
-            # Trigger immediate reconnection
-            if self._immediate_reconnect:
-                self._schedule_reconnect(address)
-            return False
+                self._update_connection_status(ConnectionStatus.RECONNECTING, "Client disconnected during write")
+                if self._immediate_reconnect:
+                    self._schedule_reconnect(address)
+                return False
+
+            try:
+                await client.write_gatt_char(characteristic_uuid, data)
+                self.logger.debug(f"Write complete to {characteristic_uuid}")
+                self._update_last_seen()
+                return True
+            except Exception as err:
+                if attempt < max_attempts:
+                    self.logger.debug(
+                        f"Write attempt {attempt}/{max_attempts} failed for "
+                        f"{characteristic_uuid}: {err} — retrying shortly without "
+                        f"tearing down the connection"
+                    )
+                    await asyncio.sleep(0.5)
+                    continue
+
+                error_msg = f"Write failed: {err}"
+                self.logger.warning(
+                    f"Error writing to characteristic {characteristic_uuid} "
+                    f"after {max_attempts} attempts: {err}"
+                )
+                # Mark as disconnected so reconnection will be attempted
+                if address in self.connected_devices:
+                    del self.connected_devices[address]
+                self._update_connection_status(ConnectionStatus.RECONNECTING, error_msg)
+                if self._immediate_reconnect:
+                    self._schedule_reconnect(address)
+                return False
+        return False
 
     async def start_notifications(self, address: str, characteristic_uuid: str) -> bool:
         """Start notifications using HA's bluetooth client.
