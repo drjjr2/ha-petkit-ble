@@ -712,11 +712,29 @@ class HABluetoothAdapter:
                     try:
                         from .PetkitW5BLEMQTT.constants import Constants
                         await asyncio.sleep(0.5)
-                        await self.start_notifications(address, Constants.READ_UUID)
-                        self.logger.info("📡 Notifications restarted successfully")
+                        notify_ok = await self.start_notifications(address, Constants.READ_UUID)
                     except Exception as e:
                         self.logger.warning(f"Failed to restart notifications: {e}")
-                    break
+                        notify_ok = False
+
+                    if notify_ok:
+                        self.logger.info("📡 Notifications restarted successfully")
+                        break
+
+                    # A connection with no working notify-subscribe never
+                    # receives data — this is NOT a usable connection, even
+                    # though the BLE link itself came up. Reporting success
+                    # here is exactly what left the device stuck showing
+                    # "connected" for hours with no data flowing. Tear down
+                    # and let the while loop immediately retry the full
+                    # connect+subscribe handshake instead.
+                    self.logger.warning(
+                        "Notifications failed to start after reconnect — connection "
+                        "isn't usable, retrying the full connect+subscribe sequence"
+                    )
+                    await self.disconnect_device(address, trigger_reconnect=False)
+                    await asyncio.sleep(0.5)
+                    continue
                 else:
                     # Very short delay before next attempt
                     delay = self._calculate_retry_delay()

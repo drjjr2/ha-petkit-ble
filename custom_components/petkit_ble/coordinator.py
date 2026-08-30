@@ -231,8 +231,18 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
 
             # Start notifications for device updates
             _LOGGER.info("Starting BLE notifications...")
-            await self.ble_manager.start_notifications(self.address, Constants.READ_UUID)
-            
+            if not await self.ble_manager.start_notifications(self.address, Constants.READ_UUID):
+                # start_notifications() already retried internally and gave up.
+                # A connection with no working notify-subscribe never receives
+                # data, so don't let initialization continue and mark this
+                # "connected" — that leaves the entity showing connected while
+                # actually dead (observed: sensor stuck on "connected" for
+                # hours with no data updates). Raise so the outer handler runs
+                # cleanup and the normal retry loop gets a real fresh attempt.
+                raise UpdateFailed(
+                    f"Could not start notifications for {self.address} after connecting"
+                )
+
             # Verify client is actually ready for writes
             client = self.ble_manager.connected_devices.get(self.address)
             if client and hasattr(client, 'is_connected'):
@@ -462,8 +472,22 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
                     self._consumer_task = asyncio.create_task(
                         self.ble_manager.message_consumer(self.address, Constants.WRITE_UUID)
                     )
-                    await self.ble_manager.start_notifications(self.address, Constants.READ_UUID)
-                    _LOGGER.info("Device reconnection successful")
+                    if await self.ble_manager.start_notifications(self.address, Constants.READ_UUID):
+                        _LOGGER.info("Device reconnection successful")
+                    else:
+                        # Connected but notify-subscribe never came up — not a
+                        # usable connection (no data will ever arrive). Don't
+                        # report success; tear down and let the reconnection
+                        # loop take another real attempt instead of leaving
+                        # this looking "connected" while actually dead.
+                        _LOGGER.warning(
+                            "Device reconnected but notifications failed to start — "
+                            "treating as not connected and retrying"
+                        )
+                        if hasattr(self.ble_manager, "disconnect_device"):
+                            await self.ble_manager.disconnect_device(
+                                self.address, trigger_reconnect=True
+                            )
                 else:
                     _LOGGER.warning("Device reconnection in progress...")
             else:
@@ -472,12 +496,21 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
                     # Restart message consumer and notifications
                     if self._consumer_task and not self._consumer_task.done():
                         self._consumer_task.cancel()
-                    
+
                     self._consumer_task = asyncio.create_task(
                         self.ble_manager.message_consumer(self.address, Constants.WRITE_UUID)
                     )
-                    await self.ble_manager.start_notifications(self.address, Constants.READ_UUID)
-                    _LOGGER.info("Device reconnection successful")
+                    if await self.ble_manager.start_notifications(self.address, Constants.READ_UUID):
+                        _LOGGER.info("Device reconnection successful")
+                    else:
+                        _LOGGER.warning(
+                            "Device reconnected but notifications failed to start — "
+                            "treating as not connected and retrying"
+                        )
+                        if hasattr(self.ble_manager, "disconnect_device"):
+                            await self.ble_manager.disconnect_device(
+                                self.address, trigger_reconnect=True
+                            )
                 else:
                     _LOGGER.error("Device reconnection failed")
         except Exception as err:
