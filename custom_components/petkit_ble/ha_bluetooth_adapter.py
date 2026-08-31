@@ -405,7 +405,7 @@ class HABluetoothAdapter:
             # Check if client is still connected before attempting write
             if hasattr(client, 'is_connected') and not client.is_connected:
                 self.logger.warning(f"Client for {address} reports not connected, triggering immediate reconnection...")
-                del self.connected_devices[address]
+                await self._release_stale_client(address, client)
                 self._update_connection_status(ConnectionStatus.RECONNECTING, "Client disconnected during write")
                 if self._immediate_reconnect:
                     self._schedule_reconnect(address)
@@ -433,12 +433,39 @@ class HABluetoothAdapter:
                 )
                 # Mark as disconnected so reconnection will be attempted
                 if address in self.connected_devices:
-                    del self.connected_devices[address]
+                    await self._release_stale_client(address, self.connected_devices[address])
                 self._update_connection_status(ConnectionStatus.RECONNECTING, error_msg)
                 if self._immediate_reconnect:
                     self._schedule_reconnect(address)
                 return False
         return False
+
+    async def _release_stale_client(self, address: str, client) -> None:
+        """Drop a client we're giving up on, disconnecting it first.
+
+        Every other place that stops using a client (disconnect_device(),
+        start_notifications() giving up and routing through
+        disconnect_device()) calls client.disconnect() before dropping the
+        reference. The write-path failure branches above used to just
+        `del self.connected_devices[address]` without ever calling
+        disconnect() — which drops HA/bleak's own bookkeeping but can leave
+        the underlying link at the proxy/peripheral still nominally open. A
+        BLE peripheral generally won't resume advertising while it still
+        thinks a central is connected to it, so a write failure that took
+        this path without an explicit disconnect could leave the fountain
+        looking like it "stopped announcing itself" — HA correctly reports
+        disconnected and searches for it, but the peripheral never comes
+        back into scan results because nothing ever told it the link was
+        over. Best-effort: if disconnect() itself fails or hangs, we still
+        drop the local reference so reconnection isn't blocked on it.
+        """
+        try:
+            if hasattr(client, "disconnect"):
+                await asyncio.wait_for(client.disconnect(), timeout=5.0)
+        except Exception as err:
+            self.logger.debug(f"Best-effort disconnect of stale client for {address} failed: {err}")
+        finally:
+            self.connected_devices.pop(address, None)
 
     async def start_notifications(self, address: str, characteristic_uuid: str) -> bool:
         """Start notifications using HA's bluetooth client.

@@ -202,15 +202,25 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
             # Enable immediate reconnection mode
             if hasattr(self.ble_manager, '_immediate_reconnect'):
                 self.ble_manager._immediate_reconnect = True
-            
-            if not await self.ble_manager.connect_device(self.address):
-                raise UpdateFailed(f"Could not connect to device {self.address}")
 
             # Watch for HA re-discovering this device's advertisements so we can
             # reconnect the instant it's back in range instead of relying purely
-            # on polling.
+            # on polling. Registered *before* the connect attempt below (and
+            # unconditionally on every pass through _initialization_loop, not
+            # just after a successful connect) — start_advertisement_watch()
+            # is idempotent (no-ops if already registered), and if this first
+            # connect attempt fails, we still want HA's scanner to nudge a
+            # reconnect the moment the device shows back up, instead of
+            # sitting on this loop's own up-to-5s polling cadence. This was
+            # the gap behind two same-day incidents where the fountain was
+            # confirmed back in the Kitchen Panel's nearby-devices list but
+            # nothing reconnected until a manual reload — the watch didn't
+            # exist yet because no connection had ever succeeded.
             if hasattr(self.ble_manager, "start_advertisement_watch"):
                 self.ble_manager.start_advertisement_watch()
+
+            if not await self.ble_manager.connect_device(self.address):
+                raise UpdateFailed(f"Could not connect to device {self.address}")
 
             # Start message consumer
             _LOGGER.info("Starting message consumer...")
@@ -408,6 +418,17 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
             # Check if device is still connected before attempting commands
             if not self.ble_manager.connected_devices.get(self.address):
                 _LOGGER.warning("Device not connected during refresh request, triggering immediate reconnection")
+                # Push the current (disconnected/reconnecting) status to entities
+                # right away instead of leaving them showing stale data. Without
+                # this, entities only ever refresh on a *successful* poll/refresh
+                # — while the device is down and repeatedly failing to reconnect,
+                # nothing calls async_update_listeners() at all, so e.g.
+                # sensor.water_fountain_connection can keep showing "connected"
+                # for the entire outage (observed: over an hour) even though the
+                # underlying connection_status has long since flipped away from
+                # CONNECTED. This makes the UI catch up within one poll interval
+                # instead of staying frozen until the next successful reconnect.
+                self.async_update_listeners()
                 # Don't wait for reconnection to complete, just trigger it
                 asyncio.create_task(self._attempt_reconnection())
                 return
@@ -515,6 +536,12 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
                     _LOGGER.error("Device reconnection failed")
         except Exception as err:
             _LOGGER.error(f"Error during reconnection attempt: {err}")
+        finally:
+            # Push whatever the outcome was (reconnected, still reconnecting,
+            # or failed) to entities right away rather than waiting for the
+            # next poll tick — covers every exit path above, including the
+            # exception case.
+            self.async_update_listeners()
 
     def async_add_listener(self, update_callback, context=None) -> callable:
         """Add a listener for data updates."""

@@ -219,7 +219,17 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         """Initialize options flow."""
-        self.config_entry = config_entry
+        try:
+            self.config_entry = config_entry
+        except AttributeError:
+            # On newer HA core (2024.12+), OptionsFlow.config_entry became a
+            # read-only property that the base class sets itself once the
+            # flow is initialized — assigning it here raises "property
+            # 'config_entry' of 'OptionsFlowHandler' object has no setter".
+            # Older core still requires this explicit assignment, so keep it
+            # for that case and just swallow the error on newer core; either
+            # way self.config_entry is readable afterward.
+            pass
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
