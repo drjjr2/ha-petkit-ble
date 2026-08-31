@@ -400,7 +400,32 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
             except asyncio.CancelledError:
                 pass
         
-        if self._initialization_task and not self._initialization_task.done():
+        # _cleanup() is called from two very different places: a real unload/
+        # reload (from a different task — safe to cancel _initialization_task
+        # here), and _initialize_device()'s own except block on a failed
+        # connect attempt, which runs *inside* _initialization_task itself
+        # (_initialization_loop -> _initialize_device -> here). In that second
+        # case, cancel() schedules a CancelledError against the task that is
+        # currently executing this very code — it lands at the next await
+        # point (often inside this method's own remaining awaits) and
+        # unwinds _initialization_loop() entirely, since CancelledError isn't
+        # an Exception subclass and isn't caught by that loop's `except
+        # Exception`. The loop's "no max retries — keep trying indefinitely"
+        # promise then silently breaks after exactly one failed attempt: the
+        # logs show a single "Device initialization failed" error and then
+        # total silence until something else (the advertisement watch, or a
+        # manual reload_config_entry) rescues it — this is very likely the
+        # real explanation behind most of the "power-cycled, showed back up,
+        # still wouldn't reconnect without a manual reload" incidents over
+        # the past several days, not just the advertisement-watch timing
+        # round 8 fixed. Guard against cancelling the task we're already
+        # running inside of.
+        current_task = asyncio.current_task()
+        if (
+            self._initialization_task
+            and not self._initialization_task.done()
+            and self._initialization_task is not current_task
+        ):
             self._initialization_task.cancel()
             # Don't await cancelled task, just let it clean up
             try:
