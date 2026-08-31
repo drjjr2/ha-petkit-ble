@@ -2,15 +2,13 @@ reset_filter:
   name: Reset filter
   description: Reset the water filter life indicator
   target:
-    device:
-      integration: petkit_ble
+    device: {}
 
 set_device_config:
-  name: Set device configuration  
+  name: Set device configuration
   description: Configure device settings like LED brightness and smart mode timing
   target:
-    device:
-      integration: petkit_ble
+    device: {}
   fields:
     smart_time_on:
       name: Smart mode on time
