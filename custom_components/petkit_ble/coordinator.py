@@ -219,7 +219,27 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
             if hasattr(self.ble_manager, "start_advertisement_watch"):
                 self.ble_manager.start_advertisement_watch()
 
-            if not await self.ble_manager.connect_device(self.address):
+            # Registering the watch above can itself race with the connect
+            # attempt below: if the device is already advertising, the watch's
+            # callback can fire immediately and kick off the adapter's own
+            # _immediate_reconnection_loop() in the background — which can win
+            # and connect before we get here. If we then call connect_device()
+            # unconditionally anyway, bleak/BlueZ can only hold one connection
+            # to the peripheral at a time, so this second attempt tears down
+            # the perfectly good connection the watch just established, which
+            # then immediately fires the disconnect callback and starts the
+            # whole reconnect cycle over — observed live: the fountain
+            # connected and streamed real data for ~17s via the watch path,
+            # then got yanked by this exact race. Skip our own connect_device()
+            # call entirely when the address is already in connected_devices —
+            # whichever path got there first wins, and this one just proceeds
+            # to wire up notifications on the connection that already exists.
+            if self.address in self.ble_manager.connected_devices:
+                _LOGGER.info(
+                    f"{self.address} already connected (advertisement-watch "
+                    f"reconnect won the race) — skipping redundant connect_device() call"
+                )
+            elif not await self.ble_manager.connect_device(self.address):
                 raise UpdateFailed(f"Could not connect to device {self.address}")
 
             # Start message consumer
