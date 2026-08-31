@@ -76,6 +76,19 @@ class HABluetoothAdapter:
         self._reconnection_task = None  # Track reconnection task
         self._unsub_bluetooth_callback = None  # HA advertisement-callback unsubscribe handle
         self._connected_event = asyncio.Event()  # Set while a client is connected
+        # Serializes the physical connect step in connect_device(). Two independent
+        # loops can both decide to reconnect at once — the coordinator's own
+        # _initialization_loop() and the adapter's advertisement-watch-triggered
+        # _immediate_reconnection_loop() — and round 9 only guards against one of
+        # them tearing down a connection the other already made; it does nothing
+        # while BOTH are simultaneously mid-connect-attempt. Two concurrent
+        # establish_connection() calls against the same address through the same
+        # ESP32 proxy contend for that proxy's single BLE radio, which shows up as
+        # a GATT connect failure that LOOKS like RF interference but isn't —
+        # observed live 2026-08-31: "Initialization attempt N" and "Immediate
+        # reconnection attempt #M" firing within the same few seconds, followed by
+        # "Failed to connect ... Interference/range" on every single attempt.
+        self._connect_lock = asyncio.Lock()
 
     async def scan(self) -> dict[str, Any]:
         """Scan for Petkit BLE devices using HA's bluetooth integration."""
@@ -174,7 +187,32 @@ class HABluetoothAdapter:
         )
 
     async def connect_device(self, address: str) -> bool:
-        """Connect to device using HA's bluetooth integration."""
+        """Connect to device using HA's bluetooth integration.
+
+        Thin wrapper that serializes the real connect attempt (see
+        self._connect_lock in __init__): the coordinator's own init/retry
+        loop and the advertisement-watch-triggered reconnect loop can both
+        call this concurrently while neither has connected yet, and two
+        simultaneous establish_connection() calls against the same address
+        through the same proxy contend for that proxy's single BLE radio —
+        observed live 2026-08-31 as a GATT connect failure on every attempt
+        that looked like RF interference but wasn't. Whichever caller gets
+        here first does the real work below; the other waits, then finds
+        the device already connected and returns immediately instead of
+        making its own redundant (and contending) attempt.
+        """
+        if self.connected_devices.get(address):
+            return True
+
+        async with self._connect_lock:
+            # Re-check now that we hold the lock — whoever held it before
+            # us may have just connected successfully.
+            if self.connected_devices.get(address):
+                return True
+            return await self._connect_device_impl(address)
+
+    async def _connect_device_impl(self, address: str) -> bool:
+        """Establish the actual BLE connection. Only call via connect_device()."""
         try:
             # Update status based on whether this is initial connection or retry
             if self._connection_attempts == 0:
