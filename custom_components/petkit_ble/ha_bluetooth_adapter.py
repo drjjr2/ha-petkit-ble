@@ -8,7 +8,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Callable
 
-from bleak_retry_connector import establish_connection
+from bleak_retry_connector import close_stale_connections_by_address, establish_connection
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.util import dt as dt_util
@@ -205,6 +205,29 @@ class HABluetoothAdapter:
                 return False
             
             self.logger.debug(f"Device found in scan, establishing BLE connection...")
+
+            # Clear out any connection BlueZ/the proxy still thinks is open for
+            # this address before trying to open a new one. Without this, a
+            # prior connect that succeeded at the BlueZ/proxy level but that
+            # our own bookkeeping lost track of (e.g. a cancelled task, or the
+            # coordinator/advertisement-watch race fixed in round 9) leaves the
+            # proxy holding a connection open — visible in the proxy's own
+            # diagnostics as "connected" — while every one of our own
+            # establish_connection() calls fails with a bare `KeyError: 'path'`
+            # (bleak's cleanup path assumes BlueZ-local device.details, which a
+            # remote ESPHome-proxied BLEDevice doesn't carry, so it can't even
+            # report the real reason it's stuck). close_stale_connections_by_address
+            # is bleak-retry-connector's own answer to exactly this: it releases
+            # whatever stale connection state BlueZ/the proxy is holding for this
+            # address so the connect attempt below starts from a clean slate.
+            # Observed live 2026-08-31: Kitchen Panel Kiosk Satellite showing the
+            # fountain connected while sensor.water_fountain_connection stayed
+            # "disconnected" and connect_device() failed 30 times in a row with
+            # this exact 'path' error.
+            try:
+                await close_stale_connections_by_address(address)
+            except Exception as err:
+                self.logger.debug(f"close_stale_connections_by_address({address}) failed (non-fatal): {err}")
 
             # Use bleak-retry-connector directly with the BLE device.
             # - disconnected_callback gives us an immediate, event-driven signal the
