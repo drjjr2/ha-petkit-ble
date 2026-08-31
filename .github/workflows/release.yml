@@ -101,17 +101,9 @@ jobs:
           echo "files_changed=$FILES_CHANGED" >> $GITHUB_OUTPUT
           echo "commits_count=$COMMITS_COUNT" >> $GITHUB_OUTPUT
 
-      - name: 🧠 Generate AI-Powered Release Notes
-        id: ai_release
-        uses: peter-murray/workflow-application-token-action@v3
-        with:
-          application_id: ${{ secrets.APP_ID }}
-          application_private_key: ${{ secrets.APP_PRIVATE_KEY }}
-        continue-on-error: true
-        
       - name: 🤖 Create Release Notes with OpenAI
         id: openai_release
-        if: env.OPENAI_API_KEY != ''
+        if: ${{ secrets.OPENAI_API_KEY != '' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -194,8 +186,8 @@ jobs:
           - 🏷️ **Version**: ${{ steps.version.outputs.version }}
           
           ### 🔗 Links
-          - **Full Changelog**: https://github.com/pdiegmann/ha-petkit-ble/compare/${{ steps.commits.outputs.previous_tag }}...${{ steps.version.outputs.tag_name }}
-          - **Issues**: https://github.com/pdiegmann/ha-petkit-ble/issues
+          - **Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ steps.commits.outputs.previous_tag }}...${{ steps.version.outputs.tag_name }}
+          - **Issues**: https://github.com/${{ github.repository }}/issues
           """
               
               with open('ai_release_notes.md', 'w') as f:
@@ -291,7 +283,7 @@ jobs:
           ### 📦 Installation & Upgrade
           
           **Via HACS (Recommended):**
-          1. Add custom repository: `https://github.com/pdiegmann/ha-petkit-ble`
+          1. Add custom repository: `https://github.com/${{ github.repository }}`
           2. Install "PetKit BLE Water Fountain" integration
           3. Restart Home Assistant
           4. Configure via Integrations page
@@ -302,10 +294,10 @@ jobs:
           3. Add integration via Configuration → Integrations
           
           ### 🔗 Resources
-          - **Full Changelog**: https://github.com/pdiegmann/ha-petkit-ble/compare/${{ steps.commits.outputs.previous_tag }}...${{ steps.version.outputs.tag_name }}
-          - **Documentation**: https://github.com/pdiegmann/ha-petkit-ble#readme
-          - **Issues & Support**: https://github.com/pdiegmann/ha-petkit-ble/issues
-          - **HACS**: https://github.com/pdiegmann/ha-petkit-ble
+          - **Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ steps.commits.outputs.previous_tag }}...${{ steps.version.outputs.tag_name }}
+          - **Documentation**: https://github.com/${{ github.repository }}#readme
+          - **Issues & Support**: https://github.com/${{ github.repository }}/issues
+          - **HACS**: https://github.com/${{ github.repository }}
           
           ### 🐾 About PetKit BLE Integration
           Control your Petkit W5 series water fountains directly through Home Assistant using Bluetooth Low Energy. Monitor battery levels, control LED settings, track filter life, and automate your pet's hydration system - all locally without cloud dependencies.
@@ -369,4 +361,4 @@ jobs:
           echo "**Files Changed**: ${{ steps.commits.outputs.files_changed }}" >> $GITHUB_STEP_SUMMARY
           echo "**Pre-release**: ${{ steps.version.outputs.is_prerelease }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "🔗 **Release URL**: https://github.com/pdiegmann/ha-petkit-ble/releases/tag/${{ steps.version.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 **Release URL**: https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
