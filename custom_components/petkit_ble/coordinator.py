@@ -175,16 +175,32 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
                 
             retry_count += 1
             
-            # Use immediate retry with minimal delays
+            # Use immediate retry with minimal delays while there's a real
+            # chance this is a quick blip, then keep backing off further the
+            # longer it drags on instead of settling on a low ceiling
+            # forever. This loop and ha_bluetooth_adapter's own
+            # _immediate_reconnection_loop() were both previously capping
+            # out at 5s between attempts indefinitely — meaning roughly two
+            # real BLE connection attempts against the fountain every 5
+            # seconds, forever, for as long as it stayed unreachable.
+            # Observed live 2026-09-01: after enough of that, the fountain
+            # stopped advertising entirely and needed a manual power cycle
+            # to recover — very plausibly this retry pressure wedging its
+            # own BLE stack, not anything on the HA/proxy side. Ramping on
+            # up to a full minute between attempts once a streak has gone
+            # on for a while gives up much less aggressively on the
+            # fountain's radio while it's out of range or power-cycling on
+            # its own, without meaningfully slowing down recovery from an
+            # ordinary short blip.
             if retry_count < 5:
                 delay = 0.5  # 500ms for first 5 attempts
             elif retry_count < 10:
-                delay = 1.0  # 1 second for next 5 attempts  
+                delay = 1.0  # 1 second for next 5 attempts
             elif retry_count < 20:
                 delay = 2.0  # 2 seconds for next 10 attempts
             else:
-                delay = 5.0  # 5 seconds afterwards
-            
+                delay = min(60.0, 5.0 + (retry_count - 20) * 1.0)  # ramp up to 60s
+
             _LOGGER.debug(f"Waiting {delay}s before next initialization attempt...")
             await asyncio.sleep(delay)
 

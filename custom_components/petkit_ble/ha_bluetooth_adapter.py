@@ -782,7 +782,14 @@ class HABluetoothAdapter:
     def _calculate_retry_delay(self):
         """Calculate exponential backoff delay."""
         if self._immediate_reconnect:
-            # For immediate reconnection, use minimal delays
+            # For immediate reconnection, use minimal delays while there's a
+            # real chance this is a quick blip, then keep backing off
+            # further the longer it drags on — this used to cap out at 5s
+            # between attempts indefinitely, same issue as (and in
+            # combination with) coordinator._initialization_loop's own
+            # ceiling; see the comment there for why that's very plausibly
+            # what has repeatedly left the fountain's BLE stack wedged
+            # (stopped advertising entirely) until a manual power cycle.
             if self._connection_attempts < 5:
                 return 0.1  # 100ms for first 5 attempts
             elif self._connection_attempts < 10:
@@ -790,8 +797,10 @@ class HABluetoothAdapter:
             elif self._connection_attempts < 20:
                 return 1.0  # 1 second for next 10 attempts
             else:
-                # Gradually increase but stay relatively low
-                return min(5.0, 1.0 + (self._connection_attempts - 20) * 0.5)
+                # Ramp on up to a full minute between attempts once a
+                # streak has gone on for a while, instead of settling on a
+                # low ceiling forever.
+                return min(60.0, 1.0 + (self._connection_attempts - 20) * 1.0)
         else:
             # Original exponential backoff for non-immediate mode
             delay = min(self._retry_delay * (2 ** self._connection_attempts), self._max_retry_delay)
