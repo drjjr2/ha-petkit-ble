@@ -39,7 +39,11 @@ class PetkitSwitchBase(CoordinatorEntity[PetkitBLECoordinator], SwitchEntity):
     @property
     def device_info(self) -> DeviceInfo:
         """Return device info dynamically."""
-        device_id = self.coordinator.device.serial if self.coordinator.device.serial != "Uninitialized" else self.coordinator.address
+        # Always keyed on the address — see the matching comment in
+        # sensor.py's PetkitSensorBase.device_info for why. Keeps this in
+        # lockstep with coordinator._sync_device_registry(), which is what
+        # actually pushes the real model/firmware/name once known.
+        device_id = self.coordinator.address
         device_name = self.coordinator.device.name_readable if self.coordinator.device.name_readable != "Uninitialized" else "Water Fountain"
         return {
             "identifiers": {(DOMAIN, device_id)},

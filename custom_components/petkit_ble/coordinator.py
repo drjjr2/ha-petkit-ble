@@ -10,6 +10,7 @@ from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.active_update_processor import ActiveBluetoothProcessorCoordinator
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .const import DOMAIN, DEFAULT_SCAN_INTERVAL, CONF_ADDRESS, CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL
@@ -107,10 +108,14 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
                 
                 # Update data object
                 self.data.update(service_info)
-                
+
+                # Push any newly-learned model/firmware/name to the device
+                # registry (no-ops once it's already up to date).
+                self._sync_device_registry()
+
                 # Notify listeners of the update
                 self.async_update_listeners()
-                
+
                 _LOGGER.debug("Device poll completed")
                 return self.data
                 
@@ -186,6 +191,60 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
     async def _async_setup(self) -> None:
         """Set up the coordinator during first refresh."""
         await self._initialize_device()
+
+    def _sync_device_registry(self) -> None:
+        """Push freshly-learned device info (model/firmware/name) into HA's
+        device registry.
+
+        The entity classes' device_info property is only actually consulted
+        once, when HA first registers the device — entities are added
+        synchronously in async_setup_entry, before the coordinator's own
+        connection attempt (a background task) has had any chance to talk
+        to the fountain. So the Device Info card is permanently stuck on
+        model "Uninitialized" / firmware "Unknown" even hours after the
+        real values (serial, firmware, product name) have arrived — nothing
+        ever tells the registry to look again after that first pass.
+
+        Call this once real values are known (after a successful data
+        refresh) to explicitly push them. Deliberately keyed on the same
+        (DOMAIN, address) identifier used at initial registration, and only
+        that — never on the entities' own device_info identifiers, which
+        switch to the serial once known — so this can only ever update the
+        one existing device entry, never create a second one.
+        """
+        if self.device.serial == "Uninitialized":
+            return  # nothing real to report yet
+
+        registry = dr.async_get(self.hass)
+        device_entry = registry.async_get_device(identifiers={(DOMAIN, self.address)})
+        if device_entry is None:
+            return
+
+        model = self.device.product_name or "Water Fountain"
+        sw_version = str(self.device.firmware) if self.device.firmware else "Unknown"
+        name = (
+            self.device.name_readable
+            if self.device.name_readable != "Uninitialized"
+            else "Water Fountain"
+        )
+
+        if (
+            device_entry.model == model
+            and device_entry.sw_version == sw_version
+            and device_entry.name == name
+        ):
+            return  # already up to date, skip the no-op registry write
+
+        registry.async_update_device(
+            device_entry.id,
+            model=model,
+            sw_version=sw_version,
+            name=name,
+        )
+        _LOGGER.info(
+            f"Updated device registry with real device info: "
+            f"model='{model}', sw_version='{sw_version}', name='{name}'"
+        )
 
     async def _initialize_device(self) -> None:
         """Initialize the BLE connection and device."""
@@ -497,7 +556,11 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
             _LOGGER.debug(f"Current device status: {self.device.status}")
             _LOGGER.debug(f"Current device config: {self.device.config}")
             _LOGGER.debug(f"Current device info: {self.device.info}")
-            
+
+            # Push any newly-learned model/firmware/name to the device
+            # registry (no-ops once it's already up to date).
+            self._sync_device_registry()
+
             # Notify all listeners that data has been updated
             self.async_update_listeners()
             _LOGGER.debug("Device data refresh completed - listeners notified")

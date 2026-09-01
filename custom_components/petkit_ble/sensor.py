@@ -26,7 +26,13 @@ async def async_setup_entry(
     coordinator: PetkitBLECoordinator = hass.data[DOMAIN][entry.entry_id]
     
     entities = [
-        PetkitBatteryLevelSensor(coordinator),
+        # No PetkitBatteryLevelSensor: the fountain is mains-powered, not
+        # battery-powered — the device always reports 0 for this field, and
+        # a device_class: battery entity makes HA show a permanent "0%"
+        # battery indicator on the Device Info card header, which reads as
+        # "nearly dead battery" rather than "not applicable". Removed
+        # rather than just hidden so it can't come back and reintroduce the
+        # header indicator.
         PetkitFilterPercentageSensor(coordinator),
         PetkitFilterTimeLeftSensor(coordinator),
         PetkitPumpRuntimeSensor(coordinator),
@@ -54,8 +60,17 @@ class PetkitSensorBase(CoordinatorEntity[PetkitBLECoordinator], SensorEntity):
     @property
     def device_info(self) -> DeviceInfo:
         """Return device info dynamically."""
-        # Use address as identifier if serial is not initialized yet
-        device_id = self.coordinator.device.serial if self.coordinator.device.serial != "Uninitialized" else self.coordinator.address
+        # Always keyed on the address, even once the real serial is known.
+        # Entities are added (and the device first registered) before the
+        # coordinator's background connection task has had a chance to run,
+        # so this always evaluates to the address on that first pass anyway
+        # — pinning it here just makes that permanent, so a later access
+        # (e.g. from a diagnostics dump) can never register a second,
+        # serial-keyed device entry alongside the original address-keyed
+        # one. coordinator._sync_device_registry() is what actually pushes
+        # the real model/firmware/name once they're known, keyed on this
+        # same identifier.
+        device_id = self.coordinator.address
         device_name = self.coordinator.device.name_readable if self.coordinator.device.name_readable != "Uninitialized" else "Water Fountain"
         return {
             "identifiers": {(DOMAIN, device_id)},
@@ -76,24 +91,6 @@ class PetkitSensorBase(CoordinatorEntity[PetkitBLECoordinator], SensorEntity):
         if self.coordinator.device.serial != "Uninitialized":
             return self.coordinator.device.serial
         return self.coordinator.address.replace(":", "")
-
-class PetkitBatteryLevelSensor(PetkitSensorBase):
-    """Battery level sensor."""
-    
-    _attr_device_class = SensorDeviceClass.BATTERY
-    _attr_native_unit_of_measurement = PERCENTAGE
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    
-    def __init__(self, coordinator: PetkitBLECoordinator) -> None:
-        """Initialize the battery sensor."""
-        super().__init__(coordinator)
-        self._attr_unique_id = f"{self._get_device_id()}_battery"
-        self._sensor_name_template = "Battery"
-    
-    @property
-    def native_value(self) -> int | None:
-        """Return the battery level."""
-        return self.coordinator.current_data.get("status", {}).get("battery")
 
 class PetkitFilterPercentageSensor(PetkitSensorBase):
     """Filter percentage sensor."""
