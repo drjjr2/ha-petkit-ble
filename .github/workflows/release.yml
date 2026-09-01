@@ -13,7 +13,14 @@ jobs:
   create-release:
     runs-on: ubuntu-latest
     name: 🤖 Create AI-Generated Release
-    
+    # Job-level env, not the step's own — a step's if: cannot see secrets
+    # directly (not in the allowed-contexts list for step if:), and it also
+    # can't see its OWN env: block (that block isn't evaluated yet at the
+    # point if: is checked). A job-level env is established before any step
+    # runs, so it's visible to every step's if: including this one.
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
     steps:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
@@ -103,9 +110,7 @@ jobs:
 
       - name: 🤖 Create Release Notes with OpenAI
         id: openai_release
-        if: ${{ secrets.OPENAI_API_KEY != '' }}
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        if: env.OPENAI_API_KEY != ''
         run: |
           cat > generate_release_notes.py << 'EOF'
           import os

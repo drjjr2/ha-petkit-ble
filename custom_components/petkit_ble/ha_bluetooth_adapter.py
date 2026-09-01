@@ -209,7 +209,36 @@ class HABluetoothAdapter:
             # us may have just connected successfully.
             if self.connected_devices.get(address):
                 return True
-            return await self._connect_device_impl(address)
+            try:
+                # Hard ceiling on the whole critical section, not just
+                # establish_connection()'s own internal timeout=10.0. If
+                # anything under the lock (e.g. close_stale_connections_by_address,
+                # which talks to BlueZ/the proxy over dbus and has no timeout
+                # of its own) ever hangs instead of raising, every future
+                # caller — the coordinator's own retry loop AND the
+                # advertisement-watch reconnect loop — blocks forever on
+                # this same lock, going totally silent with the entity
+                # stuck on "reconnecting" indefinitely. Observed live
+                # 2026-08-31 evening: connection dropped at 18:34, zero
+                # petkit_ble log lines afterward, still "reconnecting"
+                # hours later. Bounding it here guarantees the lock is
+                # always released and the retry loop keeps cycling even
+                # if something below hangs instead of failing cleanly.
+                return await asyncio.wait_for(
+                    self._connect_device_impl(address), timeout=20.0
+                )
+            except asyncio.TimeoutError:
+                self._connection_attempts += 1
+                self.logger.error(
+                    f"⏱️ connect_device() hard-timed-out after 20s for {address} "
+                    f"(attempt #{self._connection_attempts}) — something under the "
+                    f"connect lock hung instead of failing; treating as a failed "
+                    f"attempt so the retry loop keeps going"
+                )
+                self._update_connection_status(
+                    ConnectionStatus.RECONNECTING, "connect_device() hard timeout"
+                )
+                return False
 
     async def _connect_device_impl(self, address: str) -> bool:
         """Establish the actual BLE connection. Only call via connect_device()."""
