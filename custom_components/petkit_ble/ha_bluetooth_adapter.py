@@ -16,24 +16,19 @@ from homeassistant.helpers.device_registry import format_mac
 
 _LOGGER = logging.getLogger(__name__)
 
-# Prefer routing this device's connections through a specific BLE proxy when it's
-# currently available, instead of always taking whichever proxy HA's Bluetooth
-# manager thinks has the best RSSI right now. HA's automatic selection re-evaluates
-# from scratch on every connection attempt and has no concept of a "preferred"
-# source, so a technically-stronger-but-less-convenient (or less reliable, for this
-# particular device) scanner can win over one you'd rather it use — e.g. the
-# Kitchen Panel Kiosk Satellite proxy, which sits in the same room as the fountain.
-#
-# This only affects source selection for THIS device/address — it does not disable,
-# deprioritize, or otherwise touch any other proxy for any other Bluetooth device in
-# the house. When the preferred source doesn't currently see this device (e.g. it's
-# offline or out of range), connection falls straight back to HA's normal automatic
-# best-RSSI selection across every other available proxy, so the ESP32 proxies stay
-# fully available as a fallback path.
-#
-# Set to the `source` (MAC) of the scanner you want prioritized, or None to disable
-# this and always use HA's automatic best-RSSI selection.
-PREFERRED_SOURCE = "BA:34:AD:D6:58:B9"  # Kitchen Panel Kiosk Satellite proxy
+# Round 19: removed the PREFERRED_SOURCE / _get_preferred_ble_device() logic that
+# used to force connections through the Kitchen Panel Kiosk Satellite proxy
+# whenever it saw this device. That proxy's Bluetooth "radio" is actually the
+# host Fire HD10 tablet's own Android Bluetooth stack (the kiosk-satellite app
+# just tunnels it over ESPHome's native API to look like a proxy to HA) rather
+# than a purpose-built ESP32 running ESPHome's own BLE proxy firmware — phone/
+# tablet BLE stacks, especially on budget hardware, are known to be less
+# consistent for continuous low-latency GATT connections than a dedicated
+# ESP32 proxy. Observed live 2026-09-02: this device connected and stayed
+# connected cleanly through a dedicated ESP32 proxy (Bluetooth Proxy 82448c)
+# right after struggling repeatedly through the Kitchen Panel at comparable or
+# better signal strength. Back to HA's plain automatic best-RSSI selection —
+# see connect_device() below.
 
 class ConnectionStatus(Enum):
     DISCONNECTED = "disconnected"
@@ -139,53 +134,6 @@ class HABluetoothAdapter:
             self.logger.error(f"Error scanning for devices: {err}")
             return {}
 
-    def _get_preferred_ble_device(self, address: str):
-        """Return a BLEDevice for `address`, preferring PREFERRED_SOURCE.
-
-        If PREFERRED_SOURCE currently has an active advertisement for this
-        device, use that scanner's BLEDevice directly instead of whatever HA's
-        automatic best-RSSI selection would pick. If it doesn't see the device
-        right now (offline, out of range, not yet discovered), fall back to
-        HA's normal automatic selection across all other available proxies —
-        this never disables or bypasses any other scanner, it only changes
-        which one wins when there's a choice.
-        """
-        if PREFERRED_SOURCE:
-            try:
-                scanner_devices = bluetooth.async_scanner_devices_by_address(
-                    self.hass, address, connectable=True
-                )
-                # Normalize for comparison (colon/case differences between how
-                # scanner.source is formatted vs. how PREFERRED_SOURCE is written).
-                preferred_norm = PREFERRED_SOURCE.replace(":", "").lower()
-                seen = []
-                for scanner_device in scanner_devices:
-                    scanner = scanner_device.scanner
-                    source = getattr(scanner, "source", "") or ""
-                    name = getattr(scanner, "name", "") or source
-                    seen.append(f"{name} [{source}]")
-                    if source.replace(":", "").lower() == preferred_norm:
-                        self.logger.debug(f"📍 Using preferred proxy {name} for {address}")
-                        return scanner_device.ble_device
-
-                # Preferred source not among current candidates — log what WAS
-                # available (occasionally) so it's easy to confirm/correct
-                # PREFERRED_SOURCE by checking the debug log against this list.
-                if seen and self._connection_attempts % 20 == 0:
-                    self.logger.debug(
-                        f"Preferred proxy {PREFERRED_SOURCE} not currently seeing "
-                        f"{address}; candidates were: {', '.join(seen)}"
-                    )
-            except Exception as err:
-                self.logger.debug(
-                    f"Preferred-proxy lookup failed for {address}, "
-                    f"falling back to automatic selection: {err}"
-                )
-
-        return bluetooth.async_ble_device_from_address(
-            self.hass, address, connectable=True
-        )
-
     async def connect_device(self, address: str) -> bool:
         """Connect to device using HA's bluetooth integration.
 
@@ -254,9 +202,13 @@ class HABluetoothAdapter:
             
             self._last_connection_attempt = time.time()
 
-            # Get BLE device from HA's bluetooth integration, preferring
-            # PREFERRED_SOURCE when it currently sees this device.
-            self._ble_device = self._get_preferred_ble_device(address)
+            # Get BLE device from HA's bluetooth integration — plain automatic
+            # best-RSSI selection across every available proxy/scanner (round
+            # 19 removed the Kitchen-Panel-preferring logic that used to be
+            # here; see the note near the top of this file).
+            self._ble_device = bluetooth.async_ble_device_from_address(
+                self.hass, address, connectable=True
+            )
 
             if not self._ble_device:
                 error_msg = f"Device {address} not found in HA bluetooth scan"
