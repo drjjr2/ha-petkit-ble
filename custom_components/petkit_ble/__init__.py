@@ -5,8 +5,8 @@ import logging
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
+from homeassistant.core import Event, HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
@@ -40,6 +40,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     
     # Start the coordinator (this replaces async_config_entry_first_refresh for ActiveBluetoothProcessorCoordinator)
     entry.async_create_task(hass, coordinator.async_start())
+
+    # Make sure a live BLE connection gets a clean disconnect before the HA
+    # process actually goes away on a plain restart/stop.
+    #
+    # async_unload_entry() (which calls coordinator.async_shutdown() and,
+    # through it, a proper ble_manager.disconnect_device() -> client.disconnect())
+    # is NOT called during a normal `homeassistant.restart`/`homeassistant.stop`.
+    # Confirmed by reading HA core's HomeAssistant.async_stop() directly: it
+    # fires EVENT_HOMEASSISTANT_STOP, cancels all background tasks, fires
+    # EVENT_HOMEASSISTANT_FINAL_WRITE/CLOSE, and shuts down — config entries
+    # are never unloaded as part of that sequence. Unloading is a separate,
+    # explicit operation only triggered by a real entry reload/removal.
+    #
+    # Without this listener, a live BLE connection to the fountain was simply
+    # abandoned mid-restart: the process (and the task holding the BleakClient)
+    # just gets cancelled, so no BLE disconnect (LL_TERMINATE_IND) is ever sent
+    # to the fountain. The fountain's own BLE stack has no clean signal that
+    # its central went away and has to notice via its own supervision timeout
+    # — and going by observed behavior, doesn't reliably resume advertising
+    # afterward. Observed live 2026-09-02: fountain connected and healthy for
+    # 10+ hours, HA restarted for routine updates, and the fountain never
+    # became visible to any Bluetooth scanner again until it was manually
+    # power-cycled — with both the round-13 connect-lock fix and round-15
+    # backoff fix confirmed behaving correctly throughout, ruling out either
+    # of those as the cause of this particular incident.
+    #
+    # Registering via entry.async_on_unload also means this listener is
+    # correctly torn down on a real unload/reload, so it can't fire twice or
+    # reference a stale coordinator.
+    async def _async_handle_ha_stop(event: Event) -> None:
+        """Cleanly disconnect from the fountain before HA's process exits."""
+        await coordinator.async_shutdown()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_handle_ha_stop)
+    )
 
     # Register services
     async def handle_reset_filter(call: ServiceCall) -> None:
