@@ -302,10 +302,20 @@ class Commands:
         
     async def get_device_update(self):
         cmd = 230                           # Command for getting device details
-        type = 2                            # Type is 1 for sending - 2 for receiving
+        # Round 18 fix: this was the only outbound command in the whole
+        # protocol library sent with type=2 ("receiving" per this field's own
+        # documented meaning) instead of type=1 ("sending"), which every other
+        # outbound command here uses. Observed live 2026-09-02: the regular
+        # poll's three-command sequence (get_battery, get_device_state,
+        # get_device_update) reliably disconnected the fountain ~100-150ms
+        # after this exact command went out, every single cycle. Sending a
+        # malformed/mislabeled frame type is a very plausible reason the
+        # fountain's firmware would defensively drop the link right after
+        # receiving it. Changed to type=1 to match every other outbound write.
+        type = 1                            # Type is 1 for sending - 2 for receiving
         seq = self.sequence                 # Example sequence number
         data = [1]                      # No additional data for this command
-        
+
         bytes = Utils.build_command(seq, cmd, type, data)
         await self.ble_manager.message_producer(bytes)
         
