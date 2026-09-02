@@ -441,7 +441,38 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
             # This prevents the integration from failing completely on startup
 
     async def async_shutdown(self) -> None:
-        """Shutdown the coordinator and cleanup resources."""
+        """Shutdown the coordinator and cleanup resources.
+
+        Only ever called for a genuine unload/reload or (as of round 16) HA
+        stopping/restarting — never from _initialize_device()'s own retry-failure
+        path, which calls _cleanup() directly. That means it's safe to disable
+        ble_manager's auto-reconnect-on-disconnect behavior here without
+        affecting normal retry behavior.
+
+        Round 17 fix: _cleanup() below calls ble_manager.disconnect_device(),
+        which calls client.disconnect(). bleak fires the SAME
+        disconnected_callback (_on_client_disconnected in
+        ha_bluetooth_adapter.py) for that clean, intentional disconnect as it
+        does for a real unexpected drop — and that callback unconditionally
+        schedules a fresh _immediate_reconnection_loop whenever
+        self._immediate_reconnect is on. So round 16's clean shutdown
+        disconnect was itself triggering 2-3 brand new BLE connection
+        attempts against the fountain in the same ~250ms window, right before
+        HA's own shutdown sequence cancelled those tasks too — confirmed live
+        via logs from the 2026-09-02 ~08:56 restart test (disconnect at
+        08:56:43.519, reconnection attempts #1/#2/#3 at 08:56:43.527-.730,
+        "Immediate reconnection loop cancelled" at 08:56:43.774). That burst
+        of connect attempts getting cut off mid-flight, right as the proxy's
+        own connection to HA is also going away, is very plausibly what
+        actually wedged the fountain's BLE stack this time — worse than the
+        pre-round-16 behavior of just silently dropping the link once.
+        Setting _immediate_reconnect False first means the disconnect callback
+        still fires (bookkeeping still gets cleaned up) but no longer spawns a
+        new reconnect loop, so the shutdown disconnect stays a single clean
+        disconnect and nothing else.
+        """
+        if hasattr(self.ble_manager, "_immediate_reconnect"):
+            self.ble_manager._immediate_reconnect = False
         await self._cleanup()
 
     async def async_options_updated(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
