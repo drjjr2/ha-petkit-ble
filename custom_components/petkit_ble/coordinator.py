@@ -167,7 +167,17 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
         """Start the coordinator and immediately initialize connection."""
         # Start the base coordinator first (not async in ActiveBluetoothProcessorCoordinator)
         super().async_start()
-        
+
+        # Round 21: start the persistent device-identity advertisement watch
+        # here, once, for the whole life of the adapter — deliberately NOT
+        # inside _initialize_device()'s per-attempt setup (unlike
+        # start_advertisement_watch()), since it needs to keep running
+        # across connects/disconnects/retries rather than being torn down
+        # and racing to re-register before the next brief advertising
+        # window. See HABluetoothAdapter.start_identity_watch() for why the
+        # round-20 poll-time retry couldn't work and this replaces it.
+        self.ble_manager.start_identity_watch()
+
         # Immediately attempt device initialization regardless of BT discovery
         if not self._initialized:
             self._initialization_task = asyncio.create_task(self._initialization_loop())
@@ -493,6 +503,8 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
         """
         if hasattr(self.ble_manager, "_immediate_reconnect"):
             self.ble_manager._immediate_reconnect = False
+        if hasattr(self.ble_manager, "stop_identity_watch"):
+            self.ble_manager.stop_identity_watch()
         await self._cleanup()
 
     async def async_options_updated(self, hass: HomeAssistant, entry: ConfigEntry) -> None:

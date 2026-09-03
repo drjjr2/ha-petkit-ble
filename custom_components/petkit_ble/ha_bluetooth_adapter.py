@@ -70,6 +70,7 @@ class HABluetoothAdapter:
         self._immediate_reconnect = True  # Flag for immediate reconnection
         self._reconnection_task = None  # Track reconnection task
         self._unsub_bluetooth_callback = None  # HA advertisement-callback unsubscribe handle
+        self._identity_watch_unsub = None  # HA advertisement-callback unsubscribe handle (round 21, see start_identity_watch)
         self._connected_event = asyncio.Event()  # Set while a client is connected
         # Serializes the physical connect step in connect_device(). Two independent
         # loops can both decide to reconnect at once — the coordinator's own
@@ -85,54 +86,129 @@ class HABluetoothAdapter:
         # "Failed to connect ... Interference/range" on every single attempt.
         self._connect_lock = asyncio.Lock()
 
+    def _is_petkit_advertisement(self, service_info) -> bool:
+        """Shared name-based filter used by both scan() and start_identity_watch()."""
+        return bool(service_info.name) and any(
+            device_type in service_info.name for device_type in ["W4", "W5", "CTW2"]
+        )
+
+    def _mock_device_from_service_info(self, service_info) -> Any:
+        """Build the mock device object the vendored PetkitW5BLEMQTT library
+        expects out of an HA BluetoothServiceInfoBleak. Shared by scan() and
+        start_identity_watch() so both populate connectiondata identically.
+        """
+        # Convert service_data to the format expected by the library.
+        # The combine_byte_arrays function expects a dict with .values()
+        service_data_dict = {}
+        if service_info.service_data:
+            service_data_dict = service_info.service_data
+        else:
+            # Default service data with device type identifier for W5
+            service_data_dict = {"default": [0, 0, 0, 0, 0, 206]}  # 206 = W5 device type
+
+        return type('MockDevice', (), {
+            'name': service_info.name,
+            'address': service_info.address,
+            'rssi': service_info.rssi,
+            'details': {
+                'props': {
+                    'RSSI': service_info.rssi,
+                    'ServiceData': service_data_dict
+                }
+            }
+        })()
+
     async def scan(self) -> dict[str, Any]:
-        """Scan for Petkit BLE devices using HA's bluetooth integration."""
+        """Scan for Petkit BLE devices using HA's bluetooth integration.
+
+        Only finds devices HA currently considers "discovered" — i.e.
+        recently advertising. See start_identity_watch() below for why this
+        alone isn't a reliable way to (re)populate connectiondata once this
+        device has connected and stopped advertising.
+        """
         try:
             # Get discovered devices from HA's bluetooth integration
             discovered_devices = bluetooth.async_discovered_service_info(self.hass)
-            
+
             # Filter for Petkit devices
             petkit_devices = {}
             for service_info in discovered_devices:
-                if service_info.name and any(
-                    device_type in service_info.name 
-                    for device_type in ["W4", "W5", "CTW2"]
-                ):
-                    # Create a mock device object compatible with existing library
-                    # Convert service_data to the format expected by the library
-                    # The combine_byte_arrays function expects a dict with .values()
-                    service_data_dict = {}
-                    if service_info.service_data:
-                        service_data_dict = service_info.service_data
-                    else:
-                        # Default service data with device type identifier for W5
-                        service_data_dict = {"default": [0, 0, 0, 0, 0, 206]}  # 206 = W5 device type
-                    
-                    mock_device = type('MockDevice', (), {
-                        'name': service_info.name,
-                        'address': service_info.address,
-                        'rssi': service_info.rssi,
-                        'details': {
-                            'props': {
-                                'RSSI': service_info.rssi,
-                                'ServiceData': service_data_dict
-                            }
-                        }
-                    })()
-                    
+                if self._is_petkit_advertisement(service_info):
+                    mock_device = self._mock_device_from_service_info(service_info)
                     petkit_devices[service_info.address] = mock_device
                     self.connectiondata[service_info.address] = mock_device
-                    
+
             self.available_devices = petkit_devices
-            
+
             for address, device in petkit_devices.items():
                 self.logger.info(f"Found HA BLE device: {device.name} ({address})")
-                
+
             return petkit_devices
-            
+
         except Exception as err:
             self.logger.error(f"Error scanning for devices: {err}")
             return {}
+
+    def start_identity_watch(self) -> None:
+        """Continuously capture this device's advertisement service data into
+        connectiondata the instant it's ever seen advertising, independent of
+        connect/poll timing.
+
+        Round 20 tried to backfill connectiondata (needed to decode the real
+        product name/model — see coordinator._initialize_device) by re-running
+        scan() from async_request_refresh()'s regular poll loop whenever
+        identity resolution had failed. That retry only ever runs *after*
+        this device is already connected — but a BLE peripheral generally
+        stops advertising once something is connected to it, and scan()
+        only finds devices HA currently sees advertising. So that retry was
+        checking a condition that structurally can't come true in the state
+        it actually runs in. Confirmed live 2026-09-03: hours after a
+        restart, with round 20's code confirmed running (both its log lines
+        never fired), connectiondata still never got populated and the
+        Device Info card stayed stuck on the generic placeholder indefinitely.
+
+        This is the real fix: a persistent, always-on advertisement callback,
+        registered once for the whole life of the adapter (started in
+        coordinator.async_start(), stopped only in coordinator.async_shutdown()
+        — deliberately NOT tied to the connect/retry cycle the way
+        start_advertisement_watch() is) rather than a point-in-time scan().
+        HA fires this the moment its scanner sees a matching advertisement,
+        which reliably happens at least once early — HA startup or an
+        integration reload, before this device has connected to anything —
+        even if it never advertises again for the rest of the session once
+        connected. Idempotent: safe to call more than once.
+        """
+        if self._identity_watch_unsub:
+            return
+
+        @callback
+        def _on_advertisement(service_info, change) -> None:
+            if self._is_petkit_advertisement(service_info):
+                self.connectiondata[service_info.address] = self._mock_device_from_service_info(service_info)
+
+        self._identity_watch_unsub = bluetooth.async_register_callback(
+            self.hass,
+            _on_advertisement,
+            {"address": self.address},
+            bluetooth.BluetoothScanningMode.PASSIVE,
+        )
+
+        # Seed immediately from whatever HA already has cached, rather than
+        # waiting for the next fresh advertisement — covers the case where a
+        # matching advertisement was already seen before this callback was
+        # registered (e.g. HA discovered it moments before the coordinator
+        # started up).
+        if self.address not in self.connectiondata:
+            for service_info in bluetooth.async_discovered_service_info(self.hass):
+                if service_info.address == self.address and self._is_petkit_advertisement(service_info):
+                    self.connectiondata[service_info.address] = self._mock_device_from_service_info(service_info)
+                    break
+
+    def stop_identity_watch(self) -> None:
+        """Unregister the identity-watch callback, if one is active."""
+        if self._identity_watch_unsub:
+            self._identity_watch_unsub()
+            self._identity_watch_unsub = None
 
     async def connect_device(self, address: str) -> bool:
         """Connect to device using HA's bluetooth integration.
