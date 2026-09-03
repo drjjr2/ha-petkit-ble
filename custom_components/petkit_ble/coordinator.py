@@ -286,6 +286,51 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
             f"model='{model}', sw_version='{sw_version}', name='{name}'"
         )
 
+    def _cache_device_identity(self) -> None:
+        """Persist the just-resolved real device identity into the config
+        entry's own stored data (round 22).
+
+        The whole identity-resolution problem (rounds 20/21) boils down to
+        depending on catching a live BLE advertisement at the right moment
+        — which, confirmed live 2026-09-03, isn't reliable even with an
+        always-on listener, because this device only gets a real chance to
+        advertise during the brief window it's actually disconnected, and
+        reconnects happen near-instantly. But the identity byte decoded
+        from that advertisement is a fixed property of the physical
+        device — it never changes. So once it's ever been resolved
+        correctly, there's no reason to depend on re-discovering it again:
+        cache it here, and _apply_cached_device_identity() below reuses it
+        on every future connect where a live advertisement isn't
+        available, including across HA restarts (entry data persists to
+        disk).
+        """
+        identity = {
+            "name": self.device.name,
+            "name_readable": self.device.name_readable,
+            "product_name": self.device.product_name,
+            "device_type": self.device.device_type,
+            "type_code": self.device.type_code,
+        }
+        if self.entry.data.get("cached_device_identity") != identity:
+            self.hass.config_entries.async_update_entry(
+                self.entry, data={**self.entry.data, "cached_device_identity": identity}
+            )
+
+    def _apply_cached_device_identity(self) -> bool:
+        """Apply a previously-cached real device identity (see
+        _cache_device_identity() above), if one exists. Returns True if a
+        cached identity was found and applied.
+        """
+        identity = self.entry.data.get("cached_device_identity")
+        if not identity:
+            return False
+        self.device.name = identity["name"]
+        self.device.name_readable = identity["name_readable"]
+        self.device.product_name = identity["product_name"]
+        self.device.device_type = identity["device_type"]
+        self.device.type_code = identity["type_code"]
+        return True
+
     async def _initialize_device(self) -> None:
         """Initialize the BLE connection and device."""
         try:
@@ -392,9 +437,37 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
                 _LOGGER.info("Using discovered connection data for device initialization")
                 self.commands.init_device_data()
                 self._device_identity_resolved = True
+                self._cache_device_identity()
+            elif self._apply_cached_device_identity():
+                # Round 22: neither scan() nor the round-21 persistent
+                # advertisement watch had a matching advertisement this
+                # time — but we've resolved this device's real identity at
+                # least once before (this session or a prior one) and
+                # persisted it into the config entry. The identity byte
+                # this decodes from is a fixed property of the physical
+                # device, not something that changes, so reusing a past
+                # resolution is exactly as correct as a fresh one and
+                # doesn't depend on winning the advertisement-timing race
+                # every single time. Confirmed live 2026-09-03: even round
+                # 21's always-on advertisement listener never caught a
+                # fresh advertisement across several reload/reconnect
+                # tests, because this device reconnects near-instantly and
+                # a BLE peripheral doesn't get a real chance to advertise
+                # in that gap — so depending on catching a *live*
+                # advertisement at all, ever again, turned out to be an
+                # unreliable premise. This cache removes that dependency
+                # entirely once the identity has been learned one time.
+                _LOGGER.info(
+                    f"No live connection data for {self.address} — reusing "
+                    f"previously learned device identity instead of the "
+                    f"generic placeholder (name='{self.device.name_readable}', "
+                    f"product_name='{self.device.product_name}')"
+                )
+                self._device_identity_resolved = True
             else:
                 _LOGGER.warning(
-                    f"No connection data for {self.address}, using generic "
+                    f"No connection data for {self.address} and no "
+                    f"previously cached identity — using generic "
                     f"placeholder name/model for now — will retry the real "
                     f"product identification on the next poll(s)"
                 )
@@ -649,6 +722,7 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
                 if self.address in self.ble_manager.connectiondata:
                     self.commands.init_device_data()
                     self._device_identity_resolved = True
+                    self._cache_device_identity()
                     _LOGGER.info(
                         f"Resolved real device identity on retry: "
                         f"name='{self.device.name_readable}', "
