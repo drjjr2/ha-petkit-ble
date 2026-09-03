@@ -145,6 +145,20 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
         self._initialized = False
         self._listeners: set = set()
         self._initialization_task = None
+        # False until init_device_data() has actually decoded the real
+        # product identity from an advertisement's service data (see
+        # _initialize_device() below). If the very first connect attempt
+        # races ahead of a matching advertisement being cached — e.g. right
+        # after an integration reload, before HA has re-seen this device —
+        # _initialize_device() falls back to generic placeholder name/model
+        # values instead. Left False, async_request_refresh() retries the
+        # identity lookup on every regular poll until it succeeds, so a
+        # one-time startup race doesn't leave the device stuck showing a
+        # generic name/model for the rest of the session (observed live
+        # 2026-09-02: after an integration reload, HA's Device Info card
+        # showed generic "Petkit BLE Water Fountain" instead of the correct
+        # "Eversweet Solo 2" and never corrected itself).
+        self._device_identity_resolved = False
         
         # Listen for options updates
         self.entry.add_update_listener(self.async_options_updated)
@@ -367,14 +381,20 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
             if self.address in self.ble_manager.connectiondata:
                 _LOGGER.info("Using discovered connection data for device initialization")
                 self.commands.init_device_data()
+                self._device_identity_resolved = True
             else:
-                _LOGGER.warning(f"No connection data for {self.address}, using defaults")
+                _LOGGER.warning(
+                    f"No connection data for {self.address}, using generic "
+                    f"placeholder name/model for now — will retry the real "
+                    f"product identification on the next poll(s)"
+                )
                 # Set basic device info manually
                 self.device.name = "Petkit Water Fountain"
-                self.device.name_readable = "Petkit Water Fountain"  
+                self.device.name_readable = "Petkit Water Fountain"
                 self.device.product_name = "Petkit BLE Water Fountain"
                 self.device.device_type = 14  # Default device type for W5
                 self.device.type_code = 14
+                self._device_identity_resolved = False
             
             _LOGGER.info("Performing minimal device initialization...")
             
@@ -603,6 +623,25 @@ class PetkitBLECoordinator(ActiveBluetoothProcessorCoordinator[PetkitBLEData]):
             _LOGGER.debug(f"Current device status: {self.device.status}")
             _LOGGER.debug(f"Current device config: {self.device.config}")
             _LOGGER.debug(f"Current device info: {self.device.info}")
+
+            # If _initialize_device() had to fall back to a generic
+            # placeholder name/model (no matching advertisement cached yet
+            # at connect time), retry the real identity lookup here on every
+            # regular poll until it succeeds. connectiondata is repopulated
+            # by scan() from HA's currently-known advertisements, so by now
+            # — seconds to tens of seconds after connect — a real one has
+            # very likely been seen. Once resolved, _sync_device_registry()
+            # below picks up the corrected name/model immediately.
+            if not self._device_identity_resolved:
+                await self.ble_manager.scan()
+                if self.address in self.ble_manager.connectiondata:
+                    self.commands.init_device_data()
+                    self._device_identity_resolved = True
+                    _LOGGER.info(
+                        f"Resolved real device identity on retry: "
+                        f"name='{self.device.name_readable}', "
+                        f"product_name='{self.device.product_name}'"
+                    )
 
             # Push any newly-learned model/firmware/name to the device
             # registry (no-ops once it's already up to date).
